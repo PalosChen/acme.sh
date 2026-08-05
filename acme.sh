@@ -3255,6 +3255,9 @@ _initpath() {
   if [ -z "$CERT_FULLCHAIN_PATH" ]; then
     CERT_FULLCHAIN_PATH="$DOMAIN_PATH/fullchain.cer"
   fi
+  if [ "$Le_MTC_Landmark" = "1" ] && [ -z "$CERT_LANDMARK_PATH" ]; then
+    CERT_LANDMARK_PATH="$DOMAIN_PATH/$domain-landmark.cer"
+  fi
   if [ -z "$CERT_PFX_PATH" ]; then
     CERT_PFX_PATH="$DOMAIN_PATH/$domain.pfx"
   fi
@@ -4878,6 +4881,98 @@ _convertValidaty() {
   fi
 }
 
+MTC_ACCEPT_CONTENT_TYPE="application/pem-certificate-chain-with-properties"
+MTC_LANDMARK_WAIT_SECONDS=18000
+
+# Print the first acme-optional-alternate target from the current Link headers.
+_get_mtc_landmark_link() {
+  echo "$responseHeaders" | grep -i "^link:" | cut -d : -f 2- | sed 's/, *\(<[^>]*>\)/\
+\1/g' | while IFS= read -r _mtc_link_value; do
+    _mtc_link_rels="$(echo "$_mtc_link_value" | tr ';' '\n' | grep -i '^ *rel *=' | _head_n 1 | cut -d = -f 2- | tr -d '"\r')"
+    _mtc_link_rels="$(echo "$_mtc_link_rels" | _lower_case)"
+    if _contains " $_mtc_link_rels " " acme-optional-alternate "; then
+      echo "$_mtc_link_value" | _egrep_o '<[^>]*>' | _head_n 1 | tr -d '<>'
+    fi
+  done | _head_n 1
+}
+
+_restore_mtc_request_state() {
+  response="$_mtc_saved_response"
+  responseHeaders="$_mtc_saved_response_headers"
+  code="$_mtc_saved_code"
+  _H1="$_mtc_saved_h1"
+}
+
+_send_mtc_signed_request() {
+  _mtc_request_saved_h1="$_H1"
+  _H1="Accept: $MTC_ACCEPT_CONTENT_TYPE"
+  _send_signed_request "$@"
+  _mtc_request_result="$?"
+  _H1="$_mtc_request_saved_h1"
+  return "$_mtc_request_result"
+}
+
+# Fetch the optional landmark certificate without changing issuance success.
+_download_mtc_landmark() {
+  _mtc_landmark_url="$(_get_mtc_landmark_link)"
+  if [ -z "$_mtc_landmark_url" ]; then
+    _info "The CA did not offer an optional MTC landmark certificate."
+    return 0
+  fi
+
+  _mtc_saved_response="$response"
+  _mtc_saved_response_headers="$responseHeaders"
+  _mtc_saved_code="$code"
+  _mtc_saved_h1="$_H1"
+  _mtc_wait_left="$MTC_LANDMARK_WAIT_SECONDS"
+
+  while true; do
+    code=""
+    response=""
+    responseHeaders=""
+    if ! _send_mtc_signed_request "$_mtc_landmark_url"; then
+      _info "The optional MTC landmark certificate could not be downloaded."
+      _restore_mtc_request_state
+      return 0
+    fi
+
+    if [ "$code" = "202" ]; then
+      if [ "$_mtc_wait_left" -le 0 ]; then
+        _info "The optional MTC landmark certificate is still pending; continuing with the standalone certificate."
+        _restore_mtc_request_state
+        return 0
+      fi
+      _mtc_retry_after="$(echo "$responseHeaders" | grep -i '^Retry-After *: *[0-9][0-9]*' | _head_n 1 | cut -d : -f 2 | tr -d ' \r')"
+      if [ -z "$_mtc_retry_after" ] || [ "$_mtc_retry_after" -le 0 ]; then
+        _mtc_retry_after=10
+      fi
+      if [ "$_mtc_retry_after" -gt "$_mtc_wait_left" ]; then
+        _mtc_retry_after="$_mtc_wait_left"
+      fi
+      _info "The optional MTC landmark certificate is pending. Retrying in $_mtc_retry_after seconds."
+      _sleep "$_mtc_retry_after"
+      _mtc_wait_left="$(_math "$_mtc_wait_left - $_mtc_retry_after")"
+      continue
+    fi
+
+    if _startswith "$code" "2" && _contains "$response" "$BEGIN_CERT" && _contains "$response" "$END_CERT"; then
+      _mtc_landmark_tmp="$(_mktemp)"
+      if echo "$response" | _strip_blank_lines >"$_mtc_landmark_tmp" && mv "$_mtc_landmark_tmp" "$CERT_LANDMARK_PATH"; then
+        _info "The optional MTC landmark certificate is in: $(__green "$CERT_LANDMARK_PATH")"
+      else
+        rm -f "$_mtc_landmark_tmp"
+        _info "The optional MTC landmark certificate could not be saved."
+      fi
+      _restore_mtc_request_state
+      return 0
+    fi
+
+    _info "The optional MTC landmark certificate is unavailable (HTTP $code); continuing with the standalone certificate."
+    _restore_mtc_request_state
+    return 0
+  done
+}
+
 #webroot, domain domainlist  keylength
 issue() {
   if [ -z "$2" ]; then
@@ -5824,7 +5919,12 @@ $_authorizations_map"
   fi
   _info "Downloading cert."
   _info "Le_LinkCert" "$Le_LinkCert"
-  if ! _send_signed_request "$Le_LinkCert"; then
+  if [ "$Le_MTC_Landmark" = "1" ]; then
+    _send_cert_request=_send_mtc_signed_request
+  else
+    _send_cert_request=_send_signed_request
+  fi
+  if ! "$_send_cert_request" "$Le_LinkCert"; then
     _err "Signing failed. Could not download cert: $Le_LinkCert."
     _err "$response"
     _on_issue_err "$_post_hook"
@@ -5840,6 +5940,9 @@ $_authorizations_map"
 
   echo "$response" | _strip_blank_lines >"$CERT_PATH"
   _split_cert_chain "$CERT_PATH" "$CERT_FULLCHAIN_PATH" "$CA_CERT_PATH"
+  if [ "$Le_MTC_Landmark" = "1" ]; then
+    _download_mtc_landmark
+  fi
   if [ -z "$_preferred_chain" ]; then
     _preferred_chain=$(_readcaconf DEFAULT_PREFERRED_CHAIN)
   fi
@@ -5961,6 +6064,11 @@ $_authorizations_map"
     _savedomainconf "Le_ForceNewDomainKey" "$Le_ForceNewDomainKey"
   else
     _cleardomainconf Le_ForceNewDomainKey
+  fi
+  if [ "$Le_MTC_Landmark" = "1" ]; then
+    _savedomainconf "Le_MTC_Landmark" "$Le_MTC_Landmark"
+  else
+    _cleardomainconf Le_MTC_Landmark
   fi
   if [ "$_notAfter" ]; then
     Le_NextRenewTime=$(_date2time "$_notAfter")
@@ -8001,6 +8109,10 @@ Parameters:
                                       If no match, the default offered chain will be used. (default: empty)
                                       See: $_PREFERRED_CHAIN_WIKI
 
+  --mtc-landmark                    Request MTC certificate responses and optionally download the
+                                      landmark certificate as <domain>-landmark.cer. A pending or
+                                      unavailable landmark does not fail standalone certificate issuance.
+
   --cert-profile, --certificate-profile <profile>  If the CA offers profiles, select the desired profile
                                       See: $_PROFILESELECTION_WIKI
 
@@ -9002,6 +9114,9 @@ _process() {
     --eab-hmac-key)
       _eab_hmac_key="$2"
       shift
+      ;;
+    --mtc-landmark)
+      Le_MTC_Landmark="1"
       ;;
     --preferred-chain)
       _preferred_chain="$2"

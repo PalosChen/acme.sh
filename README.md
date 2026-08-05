@@ -461,6 +461,24 @@ acme.sh --issue -d example.com --dns-persist
 
 ---
 
+### Experimental MTC Certificates
+
+For an ACME server that supports Merkle Tree Certificates, add `--mtc-landmark`
+to an issue command:
+
+```sh
+acme.sh --issue --mtc-landmark -d example.com --server <mtc-ca> --standalone
+```
+
+acme.sh requests the MTC certificate representation and keeps the regular
+certificate, CA, and full-chain output paths. If the CA offers an
+`acme-optional-alternate` Link, acme.sh also writes the landmark certificate to
+`<domain>-landmark.cer`. A pending landmark is retried for at most five hours;
+if it remains unavailable, standalone certificate issuance still succeeds. The
+setting is saved for subsequent renewals.
+
+---
+
 ### 1️⃣1️⃣ Issue Certificates of Different Key Types (ECC or RSA)
 
 Just set the `keylength` to a valid, supported value.
