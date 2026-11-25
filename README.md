@@ -173,7 +173,7 @@
 | 🌐 DNS mode | Use DNS TXT records |
 | 🔗 [DNS alias mode](https://github.com/acmesh-official/acme.sh/wiki/DNS-alias-mode) | Use DNS alias for verification |
 | 📡 [Stateless mode](https://github.com/acmesh-official/acme.sh/wiki/Stateless-Mode) | Stateless verification |
-| 📌 [DNS persist mode](https://github.com/acmesh-official/acme.sh/wiki/DNS-persist-mode) | Persistent DNS TXT record ([draft-ietf-acme-dns-persist-01](https://datatracker.ietf.org/doc/draft-ietf-acme-dns-persist/)) |
+| 📌 [DNS persist mode](#-use-dns-persist-mode) | Persistent DNS TXT record ([draft-ietf-acme-dns-persist-03](https://datatracker.ietf.org/doc/html/draft-ietf-acme-dns-persist-03)) |
 
 ---
 
@@ -451,47 +451,52 @@ acme.sh --renew -d example.com
 
 ### 🔟 Use DNS Persist Mode
 
-📖 Wiki: https://github.com/acmesh-official/acme.sh/wiki/DNS-persist-mode
+This build uses [draft-ietf-acme-dns-persist-03](https://datatracker.ietf.org/doc/html/draft-ietf-acme-dns-persist-03)
+for DNS names. The ACME directory must advertise `meta.accountHashPrefix` and
+`meta.issuerDomainNames` for record generation. The command verifies the active
+ACME account and prints a TXT record whose `accounturi` binds the record domain,
+current account key thumbprint and account URL. Replace any existing draft-01
+TXT value that contains a cleartext account URL before using the updated CA.
 
-📚 Spec: [draft-ietf-acme-dns-persist-01](https://datatracker.ietf.org/doc/draft-ietf-acme-dns-persist/)
+本版本按 `draft-ietf-acme-dns-persist-03` 验证 DNS 名称。客户端验证 ACME 账户状态后，
+从 Directory 的 `accountHashPrefix` 和 `issuerDomainNames` 生成 TXT 值。`accounturi`
+使用记录所在域名、当前账户密钥指纹和账户 URL 计算。切换到新版 CA 前，请重新发布旧版
+使用明文账户 URL 的 TXT。
 
-DNS persist mode lets you place a **single, long‑lived `_validation-persist` TXT record** in your zone and reuse it for every subsequent issuance and renewal. There is no per-issuance challenge token, so renewals require **no DNS edits** — useful when DNS API access is not available but you still want unattended renewals.
+#### Generate, publish and issue
 
-#### 🪄 Step 1: Print the TXT record value
+Use the same client configuration and ACME account for both commands. The first
+command registers an account if needed. Replace `example.com` with a DNS name
+you control. Run the second command after you publish the printed TXT record and
+it propagates.
 
-```bash
-acme.sh --make-dns-persist-value -d example.com [--server letsencrypt] [--dns-persist-wildcard] [--dns-persist-ca-name "sectigo.com"] [--dns-persist-days 365]
-```
-
-Options:
-
-| Flag | Description |
-|------|-------------|
-| `--server <ca>` | Pick the CA (default is your configured default). The account is registered automatically if you have not used this CA before. |
-| `--dns-persist-wildcard` | Adds `policy=wildcard` to the record so it also authorizes wildcard / subdomain certs. |
-| `--dns-persist-ca-name <name>` | Use a specific CA identity domain (e.g. `sectigo.com`). If omitted, identities are read from the ACME directory's `caaIdentities` field and one record per identity is printed — you only need to add **any one** of them. |
-| `--dns-persist-days <N>` | Adds `persistUntil=<unix-timestamp>` to the record, set to N days from now. The CA will refuse new validations against the record after that time. Omit for a record with no expiry. |
-
-You should get an output like:
+两条命令使用同一套客户端配置和 ACME 账户。将 `example.com` 替换为你控制的域名。
+运行第一条命令生成记录，发布输出的 TXT 并等待 DNS 生效，然后执行签发命令。
 
 ```sh
-TXT persist domain:_validation-persist.example.com
-TXT persist value :"letsencrypt.org; accounturi=https://acme-v02.api.letsencrypt.org/acme/acct/123456789"
+directory=https://acme.mtc-staging.trustasia.com/acme/v2/directory
+./acme.sh --make-dns-persist-value --server "$directory" -d example.com
+./acme.sh --issue --dns-persist --server "$directory" -d example.com \
+  --cert-profile mtc-7d-07 --extended-key-usage serverAuth
 ```
 
-#### ✍️ Step 2: Add the TXT record to your DNS
+| Option | Behavior |
+|------|-------------|
+| `--dns-persist-wildcard` | Generate `policy=wildcard`. A wildcard identifier also sets this automatically. |
+| `--dns-persist-ca-name <name>` | Select one exact entry from `meta.issuerDomainNames`. By default the client prints one alternative per issuer and you publish any one. |
+| `--dns-persist-days <N>` | Add a `persistUntil` Unix timestamp N days from now. It limits fresh validation, authorization validity and proof reuse. DNS TTL controls caching. |
+| `--dns-persist-ancestor <domain>` | Use a lowercase A-label parent domain. For generation this selects the TXT owner and implies `policy=wildcard`. For issuance this sends `ancestorDomain` and saves it for renewal. |
+| `--dns-persist-opt-out` | Generate a value that can be reused at multiple DNS names for the same account. That public value can be used to correlate those names. |
 
-Add the printed `TXT persist domain` / `TXT persist value` pair as a TXT record at your DNS provider, then wait for it to propagate.
+For a parent record at `_validation-persist.example.com`, generate it with
+`-d app.example.com --dns-persist-ancestor example.com`. Use the same ancestor
+option when requesting `app.example.com` with `--dns-persist`. The CA checks
+public-suffix boundaries. Subsequent renewals can use the same published TXT
+value while the CA continues to accept it.
 
-#### 📜 Step 3: Issue the certificate
-
-```bash
-acme.sh --issue -d example.com --dns-persist
-```
-
-✅ **Done!** No challenge token is provisioned during issuance — the CA reads the persistent TXT record directly.
-
-> 🔄 Renewals just work: `acme.sh --renew -d example.com` (or the cron job) reuses the same TXT record automatically — no further DNS edits needed.
+如果用父域记录验证 `app.example.com`，生成和签发时均传入
+`--dns-persist-ancestor example.com`，并发布 `_validation-persist.example.com`。
+只要记录仍有效且 CA 允许复用，续期可以沿用同一条 TXT。
 
 ---
 

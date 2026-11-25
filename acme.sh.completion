@@ -247,7 +247,7 @@ _acme_sh_completion() {
     _acme_sh_dirs
     return 0
     ;;
-  -m | --email | --password | --useragent | --days | --valid-from | --valid-to | --httpport | --tlsport | --local-address | --dnssleep | --pre-hook | --post-hook | --renew-hook | --reloadcmd | --extended-key-usage | -b | --branch | --notify-source | --eab-kid | --eab-hmac-key | --preferred-chain | --cert-profile | --certificate-profile | --dns-persist-ca-name | --dns-persist-days)
+  -m | --email | --password | --useragent | --days | --valid-from | --valid-to | --httpport | --tlsport | --local-address | --dnssleep | --pre-hook | --post-hook | --renew-hook | --reloadcmd | --extended-key-usage | -b | --branch | --notify-source | --eab-kid | --eab-hmac-key | --preferred-chain | --cert-profile | --certificate-profile | --dns-persist-ca-name | --dns-persist-days | --dns-persist-ancestor)
     # These options take a free-form value, offer nothing.
     return 0
     ;;
@@ -277,7 +277,9 @@ _acme_sh_completion() {
     --deploy-hook
     --dns
     --dns-persist
+    --dns-persist-ancestor
     --dns-persist-ca-name
+    --dns-persist-opt-out
     --dns-persist-days
     --dns-persist-wildcard
     --dnssleep

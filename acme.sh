@@ -2144,6 +2144,8 @@ _inithttp() {
     fi
     if [ -z "$ACME_HTTP_NO_REDIRECTS" ]; then
       _ACME_CURL="$_ACME_CURL -L "
+    else
+      _ACME_CURL="$_ACME_CURL --max-redirs 0 "
     fi
     if [ "$DEBUG" ] && [ "$DEBUG" -ge 2 ]; then
       _CURL_DUMP="$(_mktemp)"
@@ -3249,6 +3251,7 @@ _clearAPI() {
   ACME_NEW_NONCE=""
   ACME_AGREEMENT=""
   ACME_RENEWAL_INFO=""
+  _ACME_DIRECTORY_JSON=""
 }
 
 #server
@@ -3295,6 +3298,8 @@ _initAPI() {
 
     ACME_RENEWAL_INFO=$(echo "$response" | _egrep_o 'renewalInfo" *: *"[^"]*"' | cut -d '"' -f 3)
     export ACME_RENEWAL_INFO
+
+    _ACME_DIRECTORY_JSON="$response"
 
     _debug "ACME_KEY_CHANGE" "$ACME_KEY_CHANGE"
     _debug "ACME_NEW_AUTHZ" "$ACME_NEW_AUTHZ"
@@ -4151,7 +4156,7 @@ _on_issue_err() {
         uri=$(echo "$ventry" | cut -d "$sep" -f 3)
         vtype=$(echo "$ventry" | cut -d "$sep" -f 4)
         _currentRoot=$(echo "$ventry" | cut -d "$sep" -f 5)
-        __trigger_validation "$uri" "$keyauthorization"
+        [ "$vtype" = "$VTYPE_DNS_PERSIST" ] || __trigger_validation "$uri" "$keyauthorization"
       done
     )
   fi
@@ -4593,132 +4598,241 @@ deactivateaccount() {
   fi
 }
 
-#domain
-#Print the Validation Domain Name where the persistent TXT record must be
-#published: the "_validation-persist" label prepended to the domain being
-#validated (draft-ietf-acme-dns-persist-01 sec 4).
-#A wildcard identifier is validated by the record at its base domain, so the
-#leading "*." label is dropped: the wildcard scope comes from 'policy=wildcard'
-#in the record value, not from a "*" label in the record name (sec 5.1, 10.2).
-_dns_persist_txt_name() {
-  _dpt_domain="$1"
-  if _startswith "$_dpt_domain" "*."; then
-    _dpt_domain="$(echo "$_dpt_domain" | sed 's/^\*\.//')"
-  fi
-  if [ -z "$_dpt_domain" ]; then
-    return 1
-  fi
-  echo "_validation-persist.$_dpt_domain"
+# Read an ASCII string or string array from a JSON object or its meta member.
+_dns_persist_json() {
+  LC_ALL=C awk -v field="$1" -v meta="$2" '
+    { json = json " " $0 }
+    END {
+      for (i = 1; i <= length(json); i++) {
+        token = substr(json, i, 1)
+        if (token == "{" || token == "[") depth++
+        else if (token == "}" || token == "]") {
+          depth--
+          if (depth == 1) in_meta = 0
+        } else if (token == "\"") {
+          if (!match(substr(json, i), /^"([^"\\]|\\.)*"/)) exit 1
+          key = substr(json, i + 1, RLENGTH - 2)
+          i += RLENGTH - 1
+          rest = substr(json, i + 1)
+          if (rest !~ /^[[:space:]]*:/) continue
+          sub(/^[[:space:]]*:[[:space:]]*/, "", rest)
+          if (meta && depth == 1 && key == "meta" && rest ~ /^\{/) in_meta = 1
+          if (key != field || (meta ? !(in_meta && depth == 2) : depth != 1)) continue
+          if (++found != 1) exit 1
+          if (match(rest, /^"([^"\\]|\\.)*"/)) value = substr(rest, 1, RLENGTH)
+          else if (match(rest, /^\[[[:space:]]*("[^"\\]*"[[:space:]]*(,[[:space:]]*"[^"\\]*"[[:space:]]*)*)?\]/))
+            value = substr(rest, 1, RLENGTH)
+          else exit 1
+        }
+      }
+      if (found != 1 || depth != 0) exit 1
+      gsub(/\\\//, "/", value)
+      print value
+    }'
 }
 
-#domain  wildcard  ca_name  days
-#Print the TXT record(s) the user must add to enable persistent DNS validation
-#per draft-ietf-acme-dns-persist-01.
+_dns_persist_valid_domain() {
+  printf '%s\n' "$1" | LC_ALL=C awk '
+    NR != 1 { bad = 1 }
+    length($0) > 253 || $0 !~ /^[a-z0-9-]+(\.[a-z0-9-]+)*$/ { bad = 1 }
+    {
+      n = split($0, labels, ".")
+      for (i = 1; i <= n; i++)
+        if (length(labels[i]) > 63 || labels[i] ~ /^-|-$/ ||
+            (substr(labels[i], 3, 2) == "--" && labels[i] !~ /^xn--./)) bad = 1
+    }
+    END { exit (!NR || bad) }'
+}
+
+# domain [ancestor]
+_dns_persist_record_domain() {
+  _dprd_base="$(_idn "$1" | LC_ALL=C _lower_case)"
+  _dprd_base="${_dprd_base#\*.}"
+  _dprd_base="${_dprd_base%.}"
+  if [ "$(_getIdType "$_dprd_base")" != dns ] || ! _dns_persist_valid_domain "$_dprd_base"; then
+    _err "Persistent DNS requires a DNS identifier: $1"
+    return 1
+  fi
+  _dprd_domain="$_dprd_base"
+  if [ "$2" ]; then
+    case "$_dprd_base" in
+    *."$2") _dprd_domain="$2" ;;
+    *)
+      _err "The persistent DNS ancestor must be a proper parent of $1."
+      return 1
+      ;;
+    esac
+  fi
+  if ! _dns_persist_valid_domain "$_dprd_domain" || [ "${#_dprd_domain}" -gt 233 ]; then
+    _err "Invalid or overlong persistent DNS record domain: $_dprd_domain"
+    return 1
+  fi
+  printf '%s\n' "$_dprd_domain"
+}
+
+# JSON issuer array [normalize CAA identities]
+_dns_persist_issuers() {
+  case "$1" in
+  \[*\]) ;;
+  *) return 1 ;;
+  esac
+  printf '%s\n' "$1" | LC_ALL=C awk '
+    { if (!match($0, /^\[[[:space:]]*"/)) exit 1
+      names = substr($0, RLENGTH + 1)
+      sub(/"[[:space:]]*\]$/, "", names)
+      gsub(/"[[:space:]]*,[[:space:]]*"/, "\n", names)
+      print names
+    }' | (
+    _dpi_count=0
+    while IFS= read -r _dpi_name; do
+      if [ "$2" ]; then
+        _dpi_name="$(_idn "$_dpi_name" | LC_ALL=C _lower_case)"
+        _dpi_name="${_dpi_name%.}"
+      fi
+      _dns_persist_valid_domain "$_dpi_name" || exit 1
+      _dpi_count=$((_dpi_count + 1))
+      [ "$2" ] || [ "$_dpi_count" -le 10 ] || exit 1
+      printf '%s\n' "$_dpi_name"
+    done
+    [ "$_dpi_count" -gt 0 ]
+  )
+}
+
+_dns_persist_hash_prefix() {
+  _dphp_value="$(printf '%s\n' "$_ACME_DIRECTORY_JSON" | _dns_persist_json accountHashPrefix meta)"
+  if ! printf '%s\n' "$_dphp_value" | LC_ALL=C grep -Eq "^\"[A-Za-z][A-Za-z0-9+.-]*:([-A-Za-z0-9._~:/?#@!\\\$&'()*+,=]|\\[|\\]|%[0-9a-fA-F]{2})+\"$"; then
+    _err "The ACME directory must advertise a valid draft-03 accountHashPrefix."
+    return 1
+  fi
+  _dphp_value="${_dphp_value#\"}"
+  printf '%s\n' "${_dphp_value%\"}"
+}
+
+# prefix, record domain (or *), JWK thumbprint, account URL
+_dns_persist_hashed_uri() {
+  _dph_digest="$(
+    {
+      printf '%b' "\\0$(printf '%03o' "${#2}")"
+      printf '%s' "$2" "$3" "$4"
+    } | _digest sha256 | _url_replace
+  )"
+  case "$_dph_digest" in
+  '' | *[!A-Za-z0-9_-]*) return 1 ;;
+  esac
+  [ "${#_dph_digest}" -eq 43 ] || return 1
+  printf '%ssha-256/%s\n' "$1" "$_dph_digest"
+}
+
+_dns_persist_check_challenge() {
+  _dpcc_challenge="$(printf '{%s}\n' "$1" | _dns_persist_json issuerDomainNames)" || return 1
+  _dpcc_issuers="$(_dns_persist_issuers "$_dpcc_challenge")" || return 1
+  for _dpcc_name in $_dns_persist_directory_issuers; do
+    printf '%s\n' "$_dpcc_issuers" | grep -Fxq -- "$_dpcc_name" || return 1
+  done
+  if [ "$_dns_persist_directory_caa" ]; then
+    for _dpcc_name in $_dpcc_issuers; do
+      printf '%s\n' "$_dns_persist_directory_caa" | grep -Fxq -- "$_dpcc_name" || return 1
+    done
+  fi
+}
+
+# Authenticate the exact account URL with an empty JWS payload and no redirects.
+_dns_persist_check_account() (
+  ACME_HTTP_NO_REDIRECTS=1
+  _ACME_CURL=""
+  _ACME_WGET=""
+  __HTTP_INITIALIZED=""
+  _CACHED_NONCE=""
+  _send_signed_request "$ACCOUNT_URL" "" || return 1
+  [ "$code" = 200 ] && [ "$(printf '%s\n' "$response" | _dns_persist_json status)" = '"valid"' ]
+)
+
+# domain, wildcard, CA name, days, ancestor, correlation opt-out
 makednspersistvalue() {
   _mdpv_domain="$1"
   _mdpv_wildcard="$2"
   _mdpv_ca_name="$3"
-  _mdpv_days="$4"
+  _mdpv_days="$(printf '%s' "$4" | sed 's/^0*//')"
+  _mdpv_parent="$5"
+  _mdpv_opt_out="$6"
 
   if [ -z "$_mdpv_domain" ]; then
     _err "Please specify a domain with -d."
     return 1
   fi
-
-  _txt_name="$(_dns_persist_txt_name "$_mdpv_domain")"
-  if [ -z "$_txt_name" ]; then
-    _err "Invalid domain: $_mdpv_domain"
-    return 1
-  fi
-  _debug _txt_name "$_txt_name"
-
-  #A wildcard identifier can only be issued if the record carries
-  #'policy=wildcard', so don't print a record that is guaranteed to fail.
-  if _startswith "$_mdpv_domain" "*." && [ "$_mdpv_wildcard" != "1" ]; then
-    _info "$_mdpv_domain is a wildcard domain, adding 'policy=wildcard' automatically."
-    _mdpv_wildcard="1"
+  _mdpv_record_domain="$(_dns_persist_record_domain "$_mdpv_domain" "$_mdpv_parent")" || return 1
+  if _startswith "$_mdpv_domain" "*." || [ "$_mdpv_parent" ]; then
+    _mdpv_wildcard=1
   fi
 
-  if [ -n "$_mdpv_days" ]; then
+  if [ "$4" ]; then
     case "$_mdpv_days" in
     '' | *[!0-9]*)
-      _err "--dns-persist-days must be a positive integer, got: $_mdpv_days"
+      _err "--dns-persist-days must be a positive integer."
       return 1
       ;;
     esac
-    if [ "$_mdpv_days" -lt 1 ]; then
-      _err "--dns-persist-days must be at least 1."
+    _mdpv_now="$(_time)"
+    if [ "${#_mdpv_days}" -gt 15 ] || [ "$_mdpv_days" -gt "$(((9223372036854775807 - _mdpv_now) / 86400))" ]; then
+      _err "--dns-persist-days would exceed the supported timestamp range."
       return 1
     fi
   fi
 
   _initpath
-
-  _accUri="$(_readcaconf ACCOUNT_URL)"
-  if [ -z "$_accUri" ]; then
-    _info "No account is registered for $ACME_DIRECTORY yet, registering one now..."
-    if ! _regAccount "$DEFAULT_ACCOUNT_KEY_LENGTH"; then
-      _err "Cannot register account."
+  case "$ACME_DIRECTORY" in
+  https://*) ;;
+  *)
+    _err "Persistent DNS record generation requires an HTTPS ACME directory."
+    return 1
+    ;;
+  esac
+  _initAPI || return 1
+  _mdpv_prefix="$(_dns_persist_hash_prefix)" || return 1
+  _mdpv_issuers="$(_dns_persist_issuers "$(printf '%s\n' "$_ACME_DIRECTORY_JSON" | _dns_persist_json issuerDomainNames meta)")" || {
+    _err "The ACME directory must advertise draft-03 issuerDomainNames to provision persistent DNS."
+    return 1
+  }
+  if [ "$_mdpv_ca_name" ]; then
+    if ! printf '%s\n' "$_mdpv_issuers" | grep -Fxq -- "$_mdpv_ca_name"; then
+      _err "--dns-persist-ca-name must match an issuerDomainNames entry."
       return 1
     fi
-    _accUri="$(_readcaconf ACCOUNT_URL)"
+    _mdpv_issuers="$_mdpv_ca_name"
   fi
 
-  if [ -z "$_accUri" ]; then
-    _err "Cannot determine the ACME account URL."
+  ACCOUNT_URL="$(_readcaconf ACCOUNT_URL)"
+  if [ -z "$ACCOUNT_URL" ]; then
+    _info "Registering an ACME account before generating the persistent TXT record."
+    _regAccount "${_accountkeylength:-$DEFAULT_ACCOUNT_KEY_LENGTH}" "$_eab_kid" "$_eab_hmac_key" || return 1
+  fi
+  if ! _startswith "$ACCOUNT_URL" "https://" || ! _dns_persist_check_account; then
+    _err "Cannot verify a valid account at its ACME account URL."
     return 1
   fi
-  _debug "Account URL" "$_accUri"
-
-  _txt_suffix="; accounturi=$_accUri"
-  if [ "$_mdpv_wildcard" = "1" ]; then
-    _txt_suffix="$_txt_suffix; policy=wildcard"
+  _calcjwk "$ACCOUNT_KEY_PATH" || return 1
+  _mdpv_thumbprint="$(__calc_account_thumbprint)"
+  [ "${#_mdpv_thumbprint}" -eq 43 ] || return 1
+  _mdpv_hash_domain="$_mdpv_record_domain"
+  if [ "$_mdpv_opt_out" ]; then
+    _mdpv_hash_domain="*"
   fi
-  if [ -n "$_mdpv_days" ]; then
-    _persist_until=$(_math "$(_time)" + "$_mdpv_days" \* 86400)
-    _txt_suffix="$_txt_suffix; persistUntil=$_persist_until"
-    _info "persistUntil set to $(__green "$(_time2str "$_persist_until")") ($_mdpv_days days from now)"
-  fi
+  _mdpv_uri="$(_dns_persist_hashed_uri "$_mdpv_prefix" "$_mdpv_hash_domain" \
+    "$_mdpv_thumbprint" "$ACCOUNT_URL")" || return 1
 
-  if [ -n "$_mdpv_ca_name" ]; then
-    _info ""
-    _info "Add the following DNS TXT record to enable persistent DNS validation:"
-    _info ""
-    _info "$(printf 'TXT persist domain:%s' "$(__green "$_txt_name")")"
-    _info "$(printf 'TXT persist value :%s' "$(__green "\"$_mdpv_ca_name$_txt_suffix\"")")"
-    _info ""
-    return 0
+  _mdpv_suffix="; accounturi=$_mdpv_uri"
+  if [ "$_mdpv_wildcard" ]; then
+    _mdpv_suffix="$_mdpv_suffix; policy=wildcard"
+  fi
+  if [ "$_mdpv_days" ]; then
+    _mdpv_suffix="$_mdpv_suffix; persistUntil=$((_mdpv_now + _mdpv_days * 86400))"
   fi
 
-  _info "Fetching ACME directory: $ACME_DIRECTORY"
-  _dir_resp="$(_get "$ACME_DIRECTORY" "" 30)"
-  if [ "$?" != "0" ] || [ -z "$_dir_resp" ]; then
-    _err "Cannot fetch ACME directory: $ACME_DIRECTORY"
-    return 1
-  fi
-  _dir_resp="$(echo "$_dir_resp" | _json_decode)"
-  _debug2 _dir_resp "$_dir_resp"
-
-  _caa_array="$(echo "$_dir_resp" | tr -d ' \r\n\t' | _egrep_o '"caaIdentities":\[[^]]*\]')"
-  _debug2 _caa_array "$_caa_array"
-  _caaids="$(echo "$_caa_array" | sed 's/.*\[//' | sed 's/\].*//' | tr ',' '\n' | tr -d '"')"
-  _debug2 _caaids "$_caaids"
-
-  if [ -z "$_caaids" ]; then
-    _err "The directory does not include 'caaIdentities'. Please specify --dns-persist-ca-name explicitly."
-    return 1
-  fi
-
-  _info ""
-  _info "Add ANY ONE of the following DNS TXT records to enable persistent DNS validation."
-  _info "(You only need to add one; pick whichever issuer identity you prefer.)"
-  for _id in $_caaids; do
-    [ -z "$_id" ] && continue
-    _info ""
-    _info "$(printf 'TXT persist domain:%s' "$(__green "$_txt_name")")"
-    _info "$(printf 'TXT persist value :%s' "$(__green "\"$_id$_txt_suffix\"")")"
+  _info "Publish one of the following DNS TXT records for this ACME account:"
+  for _mdpv_issuer in $_mdpv_issuers; do
+    _info "TXT persist domain:_validation-persist.$_mdpv_record_domain"
+    _info "TXT persist value :\"$_mdpv_issuer$_mdpv_suffix\""
   done
-  _info ""
 }
 
 # domain folder  file
@@ -4797,7 +4911,11 @@ __trigger_validation() {
   _t_vtype="$3"
   _debug2 _t_vtype "$_t_vtype"
 
-  _send_signed_request "$_t_url" "{}"
+  if [ "$_t_vtype" = "$VTYPE_DNS_PERSIST" ] && [ "$_dns_persist_ancestor" ]; then
+    _send_signed_request "$_t_url" "{\"ancestorDomain\":\"$_dns_persist_ancestor\"}"
+  else
+    _send_signed_request "$_t_url" "{}"
+  fi
 
 }
 
@@ -5336,6 +5454,24 @@ issue() {
     return 1
   fi
 
+  if _hasfield "$_web_roots" "$W_DNS_PERSIST"; then
+    _dns_persist_hash_prefix >/dev/null || return 1
+    _dns_persist_directory_issuers="$(_dns_persist_issuers "$(printf '%s\n' "$_ACME_DIRECTORY_JSON" | _dns_persist_json issuerDomainNames meta)")" || _dns_persist_directory_issuers=""
+    _dns_persist_directory_caa="$(_dns_persist_issuers "$(printf '%s\n' "$_ACME_DIRECTORY_JSON" | _dns_persist_json caaIdentities meta)" normalize)" || _dns_persist_directory_caa=""
+    if [ "$_dns_persist_ancestor" ]; then
+      if ! _dns_persist_valid_domain "$_dns_persist_ancestor"; then
+        _err "--dns-persist-ancestor must be a lowercase A-label DNS domain."
+        return 1
+      fi
+      _savedomainconf Le_DnsPersistAncestor "$_dns_persist_ancestor"
+    else
+      _cleardomainconf Le_DnsPersistAncestor
+    fi
+  elif [ "$_dns_persist_ancestor" ]; then
+    _err "--dns-persist-ancestor requires --dns-persist."
+    return 1
+  fi
+
   _savedomainconf "Le_Domain" "$_main_domain"
   _savedomainconf "Le_Alt" "$_alt_domains"
   _savedomainconf "Le_Webroot" "$_web_roots"
@@ -5722,6 +5858,12 @@ $_authorizations_map"
           # dns-persist-01 challenges have no token; the TXT record is
           # provisioned out-of-band. Use a non-empty placeholder so the
           # downstream code does not treat this entry as already verified.
+          if ! _dns_persist_check_challenge "$entry" || ! _dns_persist_record_domain "$d" "$_dns_persist_ancestor" >/dev/null; then
+            _err "$d: Cannot use the draft-03 persistent DNS challenge."
+            _clearup
+            _on_issue_err "$_post_hook"
+            return 1
+          fi
           keyauthorization="$VTYPE_DNS_PERSIST"
           _debug keyauthorization "$keyauthorization"
         else
@@ -6772,6 +6914,7 @@ renew() {
       _cleardomainconf Le_OCSP_Staple
     fi
   fi
+  _dns_persist_ancestor="${_dns_persist_ancestor_option:-$(_readdomainconf Le_DnsPersistAncestor)}"
   issue "$Le_Webroot" "$Le_Domain" "$Le_Alt" "$Le_Keylength" "$Le_RealCertPath" "$Le_RealKeyPath" "$Le_RealCACertPath" "$Le_ReloadCmd" "$Le_RealFullChainPath" "$Le_PreHook" "$Le_PostHook" "$Le_RenewHook" "$Le_LocalAddress" "$Le_ChallengeAlias" "$Le_Preferred_Chain" "$Le_Valid_From" "$Le_Valid_To" "$Le_Certificate_Profile" "$Le_ExtKeyUse"
   res="$?"
 
@@ -8557,7 +8700,7 @@ Commands:
   --register-account       Register account key.
   --deactivate-account     Deactivate the account.
   --make-dns-persist-value Print the DNS TXT record(s) to enable persistent DNS validation
-                           (draft-ietf-acme-dns-persist-01). Use with -d <domain>.
+                           (draft-ietf-acme-dns-persist-03). Use with -d <domain>.
   --create-account-key     Create an account private key, professional use.
   --install-cronjob        Install the cron job to renew certs, you don't need to call this. The 'install' command can automatically install the cron job.
   --uninstall-cronjob      Uninstall the cron job. The 'uninstall' command can do this automatically.
@@ -8609,7 +8752,7 @@ Parameters:
   --dns [dns_hook]                  Use dns manual mode or dns api. Defaults to manual mode when argument is omitted.
                                       See: $_DNS_API_WIKI
 
-  --dns-persist                     Use dns-persist-01 validation (draft-ietf-acme-dns-persist-01).
+  --dns-persist                     Use dns-persist-01 validation (draft-ietf-acme-dns-persist-03).
                                       Requires the persistent _validation-persist TXT record to already
                                       exist. Use '--make-dns-persist-value' to print the value to add.
 
@@ -8625,13 +8768,16 @@ Parameters:
 
   --dns-persist-wildcard            Used with '--make-dns-persist-value'. Adds 'policy=wildcard' to the
                                       generated TXT record so the issuer is also authorized for wildcards
-                                      and subdomains (draft-ietf-acme-dns-persist-01). It is implied when
+                                      and subdomains (draft-ietf-acme-dns-persist-03). It is implied when
                                       the domain given to -d is a wildcard (e.g. '*.example.com'); the
-                                      record itself is always published at the base domain.
+                                      record is published at the base domain or selected ancestor.
   --dns-persist-ca-name <name>      Used with '--make-dns-persist-value'. Use the given CA identity domain
                                       (e.g. 'ssl.com') as the issuer-domain-name in the TXT record. If
                                       omitted, the identities are read from the ACME directory's
-                                      'caaIdentities' field and one record is printed per identity.
+                                      'issuerDomainNames' field and one record is printed per identity.
+  --dns-persist-ancestor <domain>   Use a pre-published parent TXT record when issuing with --dns-persist.
+                                      Use the same option to generate that record with policy=wildcard.
+  --dns-persist-opt-out             Generate a TXT value that can be shared across domains for this account.
   --dns-persist-days <N>            Used with '--make-dns-persist-value'. Add a 'persistUntil' field to
                                       the TXT record so the record self-expires N days from now (the CA
                                       will refuse new validations against the record after that time).
@@ -9034,6 +9180,9 @@ _process() {
   _dns_persist_wildcard=""
   _dns_persist_ca_name=""
   _dns_persist_days=""
+  _dns_persist_ancestor=""
+  _dns_persist_ancestor_option=""
+  _dns_persist_opt_out=""
   while [ ${#} -gt 0 ]; do
     case "${1}" in
 
@@ -9138,10 +9287,30 @@ _process() {
       _dns_persist_wildcard="1"
       ;;
     --dns-persist-ca-name | --dnspersistcaname)
+      if [ -z "$2" ] || _startswith "$2" "-"; then
+        _err "--dns-persist-ca-name requires an advertised issuer name."
+        return 1
+      fi
       _dns_persist_ca_name="$2"
       shift
       ;;
+    --dns-persist-ancestor)
+      if [ -z "$2" ] || _startswith "$2" "-"; then
+        _err "--dns-persist-ancestor requires a domain."
+        return 1
+      fi
+      _dns_persist_ancestor="$2"
+      _dns_persist_ancestor_option="$2"
+      shift
+      ;;
+    --dns-persist-opt-out)
+      _dns_persist_opt_out=1
+      ;;
     --dns-persist-days | --dnspersistdays)
+      if [ -z "$2" ] || _startswith "$2" "-"; then
+        _err "--dns-persist-days requires a positive integer."
+        return 1
+      fi
       _dns_persist_days="$2"
       shift
       ;;
@@ -9735,7 +9904,8 @@ _process() {
     deactivateaccount
     ;;
   makednspersistvalue)
-    makednspersistvalue "$_domain" "$_dns_persist_wildcard" "$_dns_persist_ca_name" "$_dns_persist_days"
+    makednspersistvalue "$_domain" "$_dns_persist_wildcard" "$_dns_persist_ca_name" "$_dns_persist_days" \
+      "$_dns_persist_ancestor" "$_dns_persist_opt_out"
     ;;
   list)
     list "$_listraw" "$_domain"
